@@ -23,7 +23,12 @@ Make working with AWS SSO on local machines an ease.
   * Locks concurrent calls to `credential_process` to no DDoS your Browser (this behaviour occurs from time to time when using e.g. the k8s plugin for IntelliJ)   
 * Refresh credentials based on your previously chosen account and role (if you've chosen to persist your credentials)
 * Store your Start-URL and region
+* Configure multiple SSO Start-URLs / organizations at once - accounts and roles from all of them
+  show up in a single merged picker, and once you've picked one you never have to think about
+  which organization it came from again
 * Set different profiles for your different accounts
+* List every account and role you have access to (across all configured SSO instances) without
+  assuming any of them - `go-aws-sso list`
 
 ## Getting Started
 
@@ -43,15 +48,39 @@ Make working with AWS SSO on local machines an ease.
 
 * Just execute `go-aws-sso`
     * When you run `go-aws-sso` the first time, you will be prompted for your SSO Start URL and your region
+      * You can add more than one SSO Start URL right away, or later via `go-aws-sso config edit`
     * A config file (located at  `$HOME/$CONFIG_DIR/go-aws-sso/config.yml`) will be written with your values
 * ❔ Verify your client request if necessary
-* ✅ Choose the account you want the roles to be displayed
+    * if you've configured more than one SSO Start URL, you'll be asked to verify one client request per organization -
+      that's an AWS SSO device-authorization limitation, one browser verification per organization is unavoidable
+* ✅ Choose the account you want the roles to be displayed - if you've configured multiple SSO Start URLs, accounts
+  from all of them show up together in a single list; which organization an account belongs to doesn't matter once
+  it's configured
 * ✅ Choose a role
     * in case there is only one role available this role is taken as default
 * 🥳 Tadaa 🥳
+    * a clear confirmation of the profile/account/role you just assumed is printed
     * `credentials_process` is written to `~/.aws/credentials` and fetches fresh credentials every time something calls
       AWS (implementing a proper credentials caching mechanism is up to the calling program)
     * if you've added the flag `--persist`: short living credentials are written to `~/.aws/credentials`
+
+#### Listing Accounts and Roles
+
+If you just want to see what accounts and roles you have access to - without assuming (or writing
+credentials for) any of them - use `go-aws-sso list`:
+
+```
+$ go-aws-sso list
+Team Sandbox (111111111111)
+  - AWSAdministratorAccess
+  - ReadOnlyAccess
+
+Awesome API - Production (222222222222)
+  - AWSAdministratorAccess
+```
+
+By default it lists accounts/roles across every SSO instance configured in `config.yml`. Pass
+`-u`/`-r` to list just one organization instead (this works even without a config file at all).
 
 #### Directly Assume a Role From Command Line
 
@@ -113,6 +142,41 @@ OPTIONS:
 ### Configuration
 
 * If you want to point to a specific non-default Browser, do so via the `BROWSER` environment variable
+
+#### Multiple SSO Start URLs
+
+If you work with more than one AWS SSO organization, you can configure multiple SSO Start URLs
+(each with its own region) in `config.yml`:
+
+```yaml
+sso-instances:
+    - start-url: https://org-one.awsapps.com/start
+      region: eu-central-1
+    - start-url: https://org-two.awsapps.com/start
+      region: us-east-1
+```
+
+`go-aws-sso config generate` (run with no `-u`/`-r` flags) and `go-aws-sso config edit` will walk
+you through adding (or removing) as many as you like - including an **"Import SSO start-urls
+from ~/.aws/config"** option that scans the AWS CLI's own config file (both modern
+`[sso-session ...]` blocks and legacy inline `sso_start_url` fields on `[profile ...]`) and adds
+every start-url it finds in one go, so you don't have to retype anything you've already set up
+for the AWS CLI. Already-configured start-urls are skipped, so it's safe to run more than once.
+
+Once configured:
+
+* The interactive account picker merges accounts from every configured organization into a
+  single list - which organization an account belongs to doesn't matter anymore once you've
+  picked it.
+* `go-aws-sso refresh` remembers which organization your last-used account/role came from, so it
+  refreshes correctly regardless of how many are configured.
+* `go-aws-sso assume -a <account-id> -n <role-name>` (bypassing the interactive prompt entirely)
+  needs to know which organization to talk to - pass `-u`/`-r` explicitly if you have more than
+  one instance configured. You normally don't need to do this yourself: the `credential_process`
+  line this tool writes to `~/.aws/credentials` already includes the right `-u`/`-r` for you.
+
+A legacy config file with just a top-level `start-url`/`region` (no `sso-instances` list)
+continues to work unmodified as a single SSO instance.
 
 #### Headless Mode
 
@@ -193,6 +257,14 @@ OPTIONS:
   ```
 
 </details>
+
+### Authentication locking
+
+Authentication and forced token-cache invalidation are serialized per user using an operating-system file lock at `~/.aws/sso/cache/go-aws-sso-auth.lock`. The lock remains held while waiting for browser approval and is released immediately when the process exits, including after a fatal error or termination. The file stays on disk; do not delete it to unlock a running process.
+
+If another login is active, complete or stop that process before retrying. `--force` clears the selected token cache but does not bypass a live authorization lock. Older releases used a timestamp lock in the temporary directory; avoid running old and new binaries concurrently because they use different locking mechanisms.
+
+For agent-driven login, use `--headless`, relay each verification URL as soon as it appears, and keep the command running while the user approves it. A multi-organization listing can require a separate approval for each organization. The command needs network access and permission to write the SSO cache.
 
 ### Example Usage
 

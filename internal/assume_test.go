@@ -15,6 +15,8 @@ import (
 	"github.com/aws/aws-sdk-go/service/ssooidc/ssooidciface"
 	. "github.com/theurichde/go-aws-sso/pkg/sso"
 	"github.com/urfave/cli/v2"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 type mockSSOOIDCClient struct {
@@ -201,4 +203,32 @@ func TestAssumeDirectly_UsesActualCredentialExpiration(t *testing.T) {
 	if creds.Version != 1 {
 		t.Errorf("Version = %v, want 1", creds.Version)
 	}
+}
+
+// TestAssumeDirectly_ErrorsOnAmbiguousStartUrl asserts that when more than one SSO instance is
+// configured and no explicit -u/--start-url override is given, AssumeDirectly refuses to guess
+// and fails fast (via zap.Fatal) instead of silently picking an org.
+func TestAssumeDirectly_ErrorsOnAmbiguousStartUrl(t *testing.T) {
+	// zap.Fatal normally calls os.Exit; swap in a hook that panics instead, so the test can
+	// recover and assert the fatal path was actually taken.
+	logger := zap.New(zapcore.NewNopCore(), zap.WithFatalHook(zapcore.WriteThenPanic))
+	restore := zap.ReplaceGlobals(logger)
+	defer restore()
+
+	flagSet := flag.NewFlagSet("test-set", flag.ContinueOnError)
+	flagSet.String("start-url", "", "")
+	flagSet.String("region", "", "")
+	flagSet.String("account-id", "123456", "")
+	flagSet.String("role-name", "super-admin", "")
+	flagSet.String("profile", "default", "")
+	flagSet.Bool("persist", false, "")
+	ctx := cli.NewContext(nil, flagSet, nil)
+
+	defer func() {
+		if recover() == nil {
+			t.Errorf("expected AssumeDirectly to fatal on an ambiguous (empty) start-url, but it returned normally")
+		}
+	}()
+
+	AssumeDirectly(mockSSOOIDCClient{}, mockSSOClient{}, ctx)
 }

@@ -147,6 +147,7 @@ func TestProcessCredentialProcessTemplateWithExeName(t *testing.T) {
 		roleName     string
 		region       string
 		profile      string
+		startUrl     string
 		fileTemplate CredentialsFileTemplate
 	}{
 		{
@@ -156,8 +157,9 @@ func TestProcessCredentialProcessTemplateWithExeName(t *testing.T) {
 			roleName:  "rolename",
 			region:    "region",
 			profile:   "default",
+			startUrl:  "https://my-login.awsapps.com/start",
 			fileTemplate: CredentialsFileTemplate{
-				CredentialProcess: fmt.Sprintf("@exe#name$ assume -q -a accountid -n rolename -p default"),
+				CredentialProcess: fmt.Sprintf("@exe#name$ assume -q -a accountid -n rolename -p default -u https://my-login.awsapps.com/start -r region"),
 				Region:            "region",
 			},
 		},
@@ -168,8 +170,9 @@ func TestProcessCredentialProcessTemplateWithExeName(t *testing.T) {
 			roleName:  "rolename",
 			region:    "region",
 			profile:   "default",
+			startUrl:  "https://my-login.awsapps.com/start",
 			fileTemplate: CredentialsFileTemplate{
-				CredentialProcess: fmt.Sprintf("e x e name assume -q -a accountid -n rolename -p default"),
+				CredentialProcess: fmt.Sprintf("e x e name assume -q -a accountid -n rolename -p default -u https://my-login.awsapps.com/start -r region"),
 				Region:            "region",
 			},
 		},
@@ -183,6 +186,7 @@ func TestProcessCredentialProcessTemplateWithExeName(t *testing.T) {
 				tc.roleName,
 				tc.region,
 				tc.profile,
+				tc.startUrl,
 			)
 			if fileTemplate != tc.fileTemplate {
 				t.Errorf("File template is not equal. Got: %+v, want: %+v", fileTemplate, tc.fileTemplate)

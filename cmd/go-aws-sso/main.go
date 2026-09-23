@@ -74,6 +74,22 @@ func main() {
 
 	initialFlags = append(configFlags, initialFlags...)
 
+	listFlags := append([]cli.Flag{}, configFlags...)
+	listFlags = append(listFlags,
+		&cli.BoolFlag{
+			Name:  "force",
+			Usage: "removes the temporary access token and forces the retrieval of a new token",
+		},
+		&cli.BoolFlag{
+			Name:  "debug",
+			Usage: "enables debug logging",
+		},
+		&cli.BoolFlag{
+			Name:  "headless",
+			Usage: "show the verification URL without opening it in a browser",
+		},
+	)
+
 	cli.VersionPrinter = func(c *cli.Context) {
 		fmt.Printf("Version: %s\nCommit: %s\nBuild Time: %s\n", version, commit, date)
 	}
@@ -99,6 +115,20 @@ func main() {
 			},
 		},
 		{
+			Name:        "list",
+			Usage:       "List all accounts and their roles, without assuming any of them",
+			Description: "Lists every account (and its available roles) across all configured SSO instances. Read-only - no credentials are fetched or written.",
+			Action: func(context *cli.Context) error {
+				initializeLogger(context)
+				checkMandatoryFlags(context)
+				applyForceFlag(context)
+				ListAccountsAndRoles(context)
+				return nil
+			},
+			Before: readConfigFile(listFlags),
+			Flags:  listFlags,
+		},
+		{
 			Name:        "refresh",
 			Usage:       "Refresh your previously used credentials.",
 			Description: "Refreshes the short living credentials based on your last account and role.",
@@ -106,8 +136,7 @@ func main() {
 				initializeLogger(context)
 				checkMandatoryFlags(context)
 				applyForceFlag(context)
-				oidcApi, ssoApi := InitClients(context.String("region"))
-				RefreshCredentials(oidcApi, ssoApi, context)
+				RefreshCredentials(context)
 				return nil
 			},
 			Before: readConfigFile(initialFlags),
@@ -200,8 +229,15 @@ func readConfigFile(flags []cli.Flag) cli.BeforeFunc {
 
 func start(oidcClient ssooidciface.SSOOIDCAPI, ssoClient ssoiface.SSOAPI, context *cli.Context, promptSelector Prompt) {
 
-	startUrl := context.String("start-url")
 	LoadRuntimeConfig(context.Bool("headless"))
+
+	if context.String("start-url") == "" {
+		// more than one SSO instance is configured - merge accounts across all of them
+		startMulti(context, promptSelector)
+		return
+	}
+
+	startUrl := context.String("start-url")
 	clientInformation := ProcessClientInformation(oidcClient, startUrl)
 
 	accountInfo, awsErr := RetrieveAccountInfo(clientInformation, ssoClient, promptSelector)
@@ -216,7 +252,7 @@ func start(oidcClient ssooidciface.SSOOIDCAPI, ssoClient ssoiface.SSOAPI, contex
 	if roleErr != nil {
 		check(roleErr)
 	}
-	SaveUsageInformation(accountInfo, roleInfo)
+	SaveUsageInformation(accountInfo, roleInfo, SsoInstance{StartUrl: startUrl, Region: context.String("region")})
 
 	rci := &sso.GetRoleCredentialsInput{AccountId: accountInfo.AccountId, RoleName: roleInfo.RoleName, AccessToken: &clientInformation.AccessToken}
 	roleCredentials, err := ssoClient.GetRoleCredentials(rci)
@@ -227,14 +263,46 @@ func start(oidcClient ssooidciface.SSOOIDCAPI, ssoClient ssoiface.SSOAPI, contex
 		WriteAWSCredentialsFile(&template, context.String("profile"))
 		zap.S().Infof("Credentials expire at: %s\n", time.Unix(*roleCredentials.RoleCredentials.Expiration/1000, 0))
 	} else {
-		template := ProcessCredentialProcessTemplate(*accountInfo.AccountId, *roleInfo.RoleName, context.String("region"), context.String("profile"))
+		template := ProcessCredentialProcessTemplate(*accountInfo.AccountId, *roleInfo.RoleName, context.String("region"), context.String("profile"), startUrl)
 		WriteAWSCredentialsFile(&template, context.String("profile"))
 	}
 
+	PrintAssumedIdentity(context.String("profile"), *accountInfo.AccountName, *accountInfo.AccountId, *roleInfo.RoleName)
+}
+
+// startMulti runs the interactive account/role selection merged across every configured SSO
+// instance, so the user picks from a single list regardless of which organization an account
+// belongs to.
+func startMulti(context *cli.Context, promptSelector Prompt) {
+	instances := TryReadConfig(ConfigFilePath()).Instances()
+	tagged, err := ListAllAccounts(instances)
+	check(err)
+
+	selected := SelectMergedAccount(tagged, promptSelector)
+	roles, roleErr := ListRoles(&selected.AccountInfo, selected.ClientInformation, selected.SsoClient)
+	check(roleErr)
+	roleInfo := SelectRole(roles, promptSelector)
+
+	SaveUsageInformation(&selected.AccountInfo, roleInfo, selected.Instance)
+
+	rci := &sso.GetRoleCredentialsInput{AccountId: selected.AccountId, RoleName: roleInfo.RoleName, AccessToken: &selected.ClientInformation.AccessToken}
+	roleCredentials, err := selected.SsoClient.GetRoleCredentials(rci)
+	check(err)
+
+	if context.Bool("persist") {
+		template := ProcessPersistedCredentialsTemplate(roleCredentials, selected.Instance.Region)
+		WriteAWSCredentialsFile(&template, context.String("profile"))
+		zap.S().Infof("Credentials expire at: %s\n", time.Unix(*roleCredentials.RoleCredentials.Expiration/1000, 0))
+	} else {
+		template := ProcessCredentialProcessTemplate(*selected.AccountId, *roleInfo.RoleName, selected.Instance.Region, context.String("profile"), selected.Instance.StartUrl)
+		WriteAWSCredentialsFile(&template, context.String("profile"))
+	}
+
+	PrintAssumedIdentity(context.String("profile"), *selected.AccountName, *selected.AccountId, *roleInfo.RoleName)
 }
 
 func retryWithNewClientCreds(oidcClient ssooidciface.SSOOIDCAPI, ssoClient ssoiface.SSOAPI, startUrl string, promptSelector Prompt) (ClientInformation, *sso.AccountInfo) {
-	err := os.Remove(ClientInfoFileDestination())
+	err := os.Remove(ClientInfoFileDestination(startUrl))
 	check(err)
 	clientInformation := ProcessClientInformation(oidcClient, startUrl)
 	accountInfo, awsErr := RetrieveAccountInfo(clientInformation, ssoClient, promptSelector)
@@ -248,33 +316,66 @@ func check(err error) {
 	}
 }
 
+// checkMandatoryFlags resolves the start-url/region to use.
+//   - If both are already explicitly given (CLI flag, or a legacy single-instance config loaded
+//     via altsrc), it leaves them as-is - unchanged, single-instance behavior.
+//   - If nothing is configured at all, it prompts interactively to create a config (which may
+//     itself result in one or more SSO instances).
+//   - If exactly one SSO instance is configured, it populates the start-url/region flags from it,
+//     so all existing single-instance code paths keep working unmodified.
+//   - If more than one SSO instance is configured, it deliberately leaves start-url/region EMPTY -
+//     this is the signal downstream code uses to take the merged multi-instance path.
 func checkMandatoryFlags(context *cli.Context) {
 	zap.S().Debug("Checking mandatory flags")
-	if context.String("start-url") == "" || context.String("region") == "" {
+
+	if context.String("start-url") != "" && context.String("region") != "" {
+		return
+	}
+
+	appConfig := TryReadConfig(ConfigFilePath())
+	instances := appConfig.Instances()
+
+	if len(instances) == 0 {
 		zap.S().Warn("No Start URL given. Please set it now.")
 		err := GenerateConfigAction(context)
 		check(err)
-		appConfig := ReadConfig(ConfigFilePath())
-		err = context.Set("start-url", appConfig.StartUrl)
+		appConfig = ReadConfig(ConfigFilePath())
+		instances = appConfig.Instances()
+	}
+
+	if len(instances) == 1 {
+		err := context.Set("start-url", instances[0].StartUrl)
 		check(err)
-		err = context.Set("region", appConfig.Region)
+		err = context.Set("region", instances[0].Region)
 		check(err)
 	}
 }
 
 func applyForceFlag(context *cli.Context) {
-	if context.Bool("force") {
-		err := os.Remove(ClientInfoFileDestination())
-		if err != nil {
-			zap.S().Infof("Nothing to do, no temporary access token found")
-		} else {
-			zap.S().Infof("Removed temporary access token")
+	if !context.Bool("force") {
+		return
+	}
+
+	// Cache invalidation must not race an active authorization flow.
+	release, err := AcquireAuthorizationLock()
+	check(err)
+	defer release()
+
+	var targetStartUrls []string
+	if context.String("start-url") != "" {
+		targetStartUrls = []string{context.String("start-url")}
+	} else {
+		for _, instance := range TryReadConfig(ConfigFilePath()).Instances() {
+			targetStartUrls = append(targetStartUrls, instance.StartUrl)
 		}
-		err = os.Remove(os.TempDir() + "/go-aws-sso.lock")
+	}
+
+	for _, startUrl := range targetStartUrls {
+		err := os.Remove(ClientInfoFileDestination(startUrl))
 		if err != nil {
-			zap.S().Debugf("Nothing to do, no temporary lock file found")
+			zap.S().Infof("Nothing to do, no temporary access token found for %s", startUrl)
 		} else {
-			zap.S().Infof("Removed temporary lock file")
+			zap.S().Infof("Removed temporary access token for %s", startUrl)
 		}
 	}
 }
