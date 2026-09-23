@@ -1,7 +1,7 @@
 package sso
 
 import (
-	"encoding/json"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"os"
@@ -25,7 +25,7 @@ import (
 const grantType = "urn:ietf:params:oauth:grant-type:device_code"
 const clientType = "public"
 const clientName = "go-aws-sso"
-const lockedAuthFlowMsg = "There is already an authorization flow running. If you think that is wrong, try using --force"
+const lockedAuthFlowMsg = "There is already an authorization flow running. Complete or stop that process before retrying; --force does not bypass an active login."
 
 var AwsRegions = []string{
 	"us-east-2",
@@ -87,9 +87,14 @@ func InitClients(region string) (ssooidciface.SSOOIDCAPI, ssoiface.SSOAPI) {
 	return oidcClient, ssoClient
 }
 
-func ClientInfoFileDestination() string {
+// ClientInfoFileDestination returns the per-start-url cache path for the OIDC client/token
+// information. It is keyed by a hash of the start-url so multiple SSO instances can be cached
+// side by side, and prefixed distinctly so it doesn't collide with the AWS CLI's own SSO token
+// cache files in the same directory.
+func ClientInfoFileDestination(startUrl string) string {
 	homeDir, _ := os.UserHomeDir()
-	return homeDir + "/.aws/sso/cache/access-token.json"
+	hash := sha1.Sum([]byte(startUrl))
+	return homeDir + fmt.Sprintf("/.aws/sso/cache/go-aws-sso-%x.json", hash)
 }
 
 func (ati ClientInformation) isExpired() bool {
@@ -104,29 +109,20 @@ func (ati ClientInformation) isExpired() bool {
 // If the start url is overridden and differs from the previous one, a new Client is registered for the given start url.
 // When the ClientInformation.AccessToken is expired, it starts retrieving a new AccessToken
 func ProcessClientInformation(oidcClient ssooidciface.SSOOIDCAPI, startUrl string) ClientInformation {
-	if isAuthorizationFlowLocked() {
-		zap.S().Fatal(lockedAuthFlowMsg)
-	}
+	release, err := AcquireAuthorizationLock()
+	check(err)
+	defer release()
 
-	clientInformation, err := ReadClientInformation(ClientInfoFileDestination())
+	clientInformation, err := ReadClientInformation(ClientInfoFileDestination(startUrl))
 	if err != nil || clientInformation.StartUrl != startUrl {
-		lockAuthorizationFlow()
-		defer unlockAuthorizationFlow()
 		zap.S().Debugf("Encountered error while reading client information: %s", err)
-		var clientInfoPointer *ClientInformation
-		clientInfoPointer = registerClient(oidcClient, startUrl)
+		clientInfoPointer := registerClient(oidcClient, startUrl)
 		clientInfoPointer = retrieveToken(oidcClient, Time{}, clientInfoPointer)
-		WriteStructToFile(clientInfoPointer, ClientInfoFileDestination())
+		WriteStructToFile(clientInfoPointer, ClientInfoFileDestination(startUrl))
 		clientInformation = *clientInfoPointer
 	} else if clientInformation.isExpired() {
-		if isAuthorizationFlowLocked() {
-			zap.S().Fatal(lockedAuthFlowMsg)
-		} else {
-			lockAuthorizationFlow()
-			defer unlockAuthorizationFlow()
-			zap.S().Info("AccessToken expired. Start retrieving a new AccessToken")
-			clientInformation = handleOutdatedAccessToken(clientInformation, oidcClient, startUrl)
-		}
+		zap.S().Info("AccessToken expired. Start retrieving a new AccessToken")
+		clientInformation = handleOutdatedAccessToken(clientInformation, oidcClient, startUrl)
 	}
 	return clientInformation
 }
@@ -136,7 +132,7 @@ func handleOutdatedAccessToken(clientInformation ClientInformation, oidcClient s
 	clientInformation.DeviceCode = *startDeviceAuthorization(oidcClient, &registerClientOutput, startUrl).DeviceCode
 	var clientInfoPointer *ClientInformation
 	clientInfoPointer = retrieveToken(oidcClient, Time{}, &clientInformation)
-	WriteStructToFile(clientInfoPointer, ClientInfoFileDestination())
+	WriteStructToFile(clientInfoPointer, ClientInfoFileDestination(startUrl))
 	return *clientInfoPointer
 }
 
@@ -248,45 +244,4 @@ func retrieveToken(client ssooidciface.SSOOIDCAPI, timer Timer, info *ClientInfo
 			return info
 		}
 	}
-}
-
-type lockfile struct {
-	LockTime time.Time `json:"lockTime"`
-}
-
-func unlockAuthorizationFlow() {
-	_ = os.Remove(os.TempDir() + "/go-aws-sso.lock")
-}
-
-func lockAuthorizationFlow() {
-	lf := lockfile{LockTime: time.Now()}
-	lockBytes, err := json.Marshal(lf)
-	if err != nil {
-		zap.S().Error("Something went wrong while marshalling the temporary lock file", err)
-	}
-
-	err = os.WriteFile(os.TempDir()+"/go-aws-sso.lock", lockBytes, 0644)
-	if err != nil {
-		zap.S().Error("Something went wrong writing the temporary lock file", err)
-	}
-}
-
-func isAuthorizationFlowLocked() bool {
-	lockBytes, err := os.ReadFile(os.TempDir() + "/go-aws-sso.lock")
-	var pathError *os.PathError
-	if err != nil {
-		if errors.As(err, &pathError) {
-			zap.S().Debug("No lock file found")
-			return false
-		}
-		zap.S().Error("Something went wrong while reading the temporary lock file", err)
-	}
-	lf := lockfile{}
-	err = json.Unmarshal(lockBytes, &lf)
-	if err != nil {
-		zap.S().Error("Something went wrong while unmarshalling the temporary lock file", err)
-		return false
-	}
-
-	return time.Now().Before(lf.LockTime.Add(time.Minute))
 }

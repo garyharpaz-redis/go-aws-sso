@@ -172,6 +172,73 @@ func (receiver mockPromptUISelector) Prompt(_ string, _ string) string {
 	return ""
 }
 
+func TestCheckMandatoryFlags(t *testing.T) {
+	tests := []struct {
+		name         string
+		configYaml   string
+		wantStartUrl string
+		wantRegion   string
+	}{
+		{
+			name:         "single legacy instance populates start-url/region",
+			configYaml:   "start-url: https://single.awsapps.com/start\nregion: eu-central-1\n",
+			wantStartUrl: "https://single.awsapps.com/start",
+			wantRegion:   "eu-central-1",
+		},
+		{
+			name: "single new-style instance populates start-url/region",
+			configYaml: "sso-instances:\n" +
+				"  - start-url: https://only.awsapps.com/start\n    region: eu-west-1\n",
+			wantStartUrl: "https://only.awsapps.com/start",
+			wantRegion:   "eu-west-1",
+		},
+		{
+			name: "multiple instances leave start-url/region empty",
+			configYaml: "sso-instances:\n" +
+				"  - start-url: https://one.awsapps.com/start\n    region: eu-central-1\n" +
+				"  - start-url: https://two.awsapps.com/start\n    region: us-east-1\n",
+			wantStartUrl: "",
+			wantRegion:   "",
+		},
+	}
+
+	oldHome := os.Getenv("HOME")
+	defer os.Setenv("HOME", oldHome)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home, err := os.MkdirTemp("", "go-aws-sso-home")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(home)
+			os.Setenv("HOME", home)
+
+			configDir := home + "/.config/go-aws-sso"
+			if err := os.MkdirAll(configDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(configDir+"/config.yml", []byte(tt.configYaml), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			flagSet := flag.NewFlagSet("test-set", flag.ContinueOnError)
+			flagSet.String("start-url", "", "")
+			flagSet.String("region", "", "")
+			ctx := cli.NewContext(nil, flagSet, nil)
+
+			checkMandatoryFlags(ctx)
+
+			if got := ctx.String("start-url"); got != tt.wantStartUrl {
+				t.Errorf("start-url = %q, want %q", got, tt.wantStartUrl)
+			}
+			if got := ctx.String("region"); got != tt.wantRegion {
+				t.Errorf("region = %q, want %q", got, tt.wantRegion)
+			}
+		})
+	}
+}
+
 func Test_initializeLogger(t *testing.T) {
 	type levelsEnabled struct {
 		fatal bool

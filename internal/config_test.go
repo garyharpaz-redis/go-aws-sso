@@ -70,3 +70,44 @@ func fail(err error, t *testing.T) {
 		t.Errorf("unexpected error: %q", err)
 	}
 }
+
+func TestAppConfig_Instances(t *testing.T) {
+	tests := []struct {
+		name string
+		ac   AppConfig
+		want []SsoInstance
+	}{
+		{
+			name: "new-style sso-instances list is used as-is",
+			ac: AppConfig{
+				SsoInstances: []SsoInstance{
+					{StartUrl: "https://one.awsapps.com/start", Region: "eu-central-1"},
+					{StartUrl: "https://two.awsapps.com/start", Region: "us-east-1"},
+				},
+			},
+			want: []SsoInstance{
+				{StartUrl: "https://one.awsapps.com/start", Region: "eu-central-1"},
+				{StartUrl: "https://two.awsapps.com/start", Region: "us-east-1"},
+			},
+		},
+		{
+			name: "legacy single start-url/region is migrated to a one-element list",
+			ac:   AppConfig{StartUrl: "https://legacy.awsapps.com/start", Region: "eu-west-1"},
+			want: []SsoInstance{{StartUrl: "https://legacy.awsapps.com/start", Region: "eu-west-1"}},
+		},
+		{
+			name: "nothing configured returns an empty list",
+			ac:   AppConfig{},
+			want: nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.ac.Instances()
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got: %+v, want: %+v", got, tt.want)
+			}
+		})
+	}
+}

@@ -34,15 +34,15 @@ func ProcessPersistedCredentialsTemplate(credentials *sso.GetRoleCredentialsOutp
 	return profileTemplate
 }
 
-func ProcessCredentialProcessTemplate(accountId string, roleName string, region string, profile string) CredentialsFileTemplate {
+func ProcessCredentialProcessTemplate(accountId string, roleName string, region string, profile string, startUrl string) CredentialsFileTemplate {
 	exeName, err := os.Executable()
 	check(err)
-	return processCredentialProcessTemplateWithExeName(exeName, accountId, roleName, region, profile)
+	return processCredentialProcessTemplateWithExeName(exeName, accountId, roleName, region, profile, startUrl)
 }
 
-func processCredentialProcessTemplateWithExeName(exeName string, accountId string, roleName string, region string, profile string) CredentialsFileTemplate {
+func processCredentialProcessTemplateWithExeName(exeName string, accountId string, roleName string, region string, profile string, startUrl string) CredentialsFileTemplate {
 	profileTemplate := CredentialsFileTemplate{
-		CredentialProcess: fmt.Sprintf("%s assume -q -a %s -n %s -p %s", exeName, accountId, roleName, profile),
+		CredentialProcess: fmt.Sprintf("%s assume -q -a %s -n %s -p %s -u %s -r %s", exeName, accountId, roleName, profile, startUrl, region),
 		Region:            region,
 	}
 	return profileTemplate
@@ -106,7 +106,7 @@ func isFileOrFolderExisting(target string) bool {
 func ReadClientInformation(file string) (ClientInformation, error) {
 	if isFileOrFolderExisting(file) {
 		clientInformation := ClientInformation{}
-		content, _ := os.ReadFile(ClientInfoFileDestination())
+		content, _ := os.ReadFile(file)
 		err := json.Unmarshal(content, &clientInformation)
 		check(err)
 		return clientInformation, nil
